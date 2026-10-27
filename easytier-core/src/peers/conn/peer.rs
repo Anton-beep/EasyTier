@@ -315,6 +315,15 @@ impl Peer {
         Ok(())
     }
 
+    /// Connections that consume the per-peer server cap: admitted through the
+    /// server path, excluding attached-ring connections, which bypass the cap.
+    pub(crate) fn server_conn_count(&self) -> usize {
+        self.conns
+            .iter()
+            .filter(|conn| !conn.is_closed() && conn.is_server_admitted() && !conn.is_attached())
+            .count()
+    }
+
     pub async fn close_peer_conn(&self, conn_id: &PeerConnId) -> Result<(), Error> {
         let has_key = self.conns.contains_key(conn_id);
         if !has_key {
@@ -424,6 +433,28 @@ mod tests {
         recv: PacketRecvChan,
         rtt: Option<u32>,
     ) -> (PeerConnId, PeerConn) {
+        add_connection_with_role(peer, recv, rtt, TestConnRole::Client).await
+    }
+
+    async fn add_server_connection(
+        peer: &Peer,
+        recv: PacketRecvChan,
+        rtt: Option<u32>,
+    ) -> (PeerConnId, PeerConn) {
+        add_connection_with_role(peer, recv, rtt, TestConnRole::Server).await
+    }
+
+    enum TestConnRole {
+        Client,
+        Server,
+    }
+
+    async fn add_connection_with_role(
+        peer: &Peer,
+        recv: PacketRecvChan,
+        rtt: Option<u32>,
+        role: TestConnRole,
+    ) -> (PeerConnId, PeerConn) {
         let (left, right) = create_ring_tunnel_pair();
         let sessions = Arc::new(PeerSessionStore::new());
         let context = Arc::new(NoopPeerContext::default());
@@ -435,13 +466,19 @@ mod tests {
         );
         left.unwrap();
         right.unwrap();
-        server.start_recv_loop(recv).await;
         if let Some(rtt) = rtt {
             client.record_latency_for_test(rtt);
         }
-        let id = client.get_conn_id();
-        peer.add_peer_conn(client).await.unwrap();
-        (id, server)
+        // Peer::add_peer_conn starts the stored conn; start the other side too so
+        // the pair stays live for the test.
+        let (added, mut remote) = match role {
+            TestConnRole::Client => (client, server),
+            TestConnRole::Server => (server, client),
+        };
+        remote.start_recv_loop(recv).await;
+        let id = added.get_conn_id();
+        peer.add_peer_conn(added).await.unwrap();
+        (id, remote)
     }
 
     fn new_peer() -> Peer {
@@ -664,6 +701,49 @@ mod tests {
                 peer.select_flow_conn(flow(port)).unwrap().get_conn_id(),
                 old
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn server_conn_count_counts_only_server_admitted_connections() {
+        let peer = new_peer();
+        let mut remote_conns = Vec::new();
+        for _ in 0..2 {
+            let (sender, _receiver) = create_packet_recv_chan();
+            let (_, remote) = add_connection(&peer, sender, None).await;
+            remote_conns.push(remote);
+        }
+        let (sender, _receiver) = create_packet_recv_chan();
+        let (_, remote) = add_server_connection(&peer, sender, None).await;
+        remote_conns.push(remote);
+
+        assert_eq!(peer.server_conn_count(), 1);
+        assert_eq!(peer.conns.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn server_conn_count_releases_closed_connections() {
+        let peer = new_peer();
+        let mut conn_ids = Vec::new();
+        let mut _remote_conns = Vec::new();
+        for _ in 0..3 {
+            let (sender, _receiver) = create_packet_recv_chan();
+            let (conn_id, remote) = add_server_connection(&peer, sender, None).await;
+            conn_ids.push(conn_id);
+            _remote_conns.push(remote);
+        }
+        assert_eq!(peer.server_conn_count(), 3);
+
+        peer.close_peer_conn(&conn_ids[0]).await.unwrap();
+
+        let start = std::time::Instant::now();
+        while peer.server_conn_count() != 2 {
+            assert!(
+                start.elapsed() < std::time::Duration::from_secs(2),
+                "closed connection still consumes the server cap: {}",
+                peer.server_conn_count()
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
     }
 }

@@ -440,6 +440,11 @@ impl PeerConn {
         self.origin == PeerConnectionOrigin::Attached
     }
 
+    /// Whether this node admitted the connection through the server path.
+    pub(crate) fn is_server_admitted(&self) -> bool {
+        self.is_client == Some(false)
+    }
+
     pub fn is_hole_punched(&self) -> bool {
         matches!(
             self.origin,

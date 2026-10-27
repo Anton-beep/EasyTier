@@ -363,6 +363,10 @@ where
                     dst_peer_id,
                     "tcp hole punch initiator accepted and added server tunnel"
                 );
+                // One admitted path completes the punch. Looping until the caller's
+                // timeout made every successful punch report failure, so the initiator
+                // retried forever and admitted another connection on each attempt.
+                return Ok(());
             }
             Err(error) => {
                 tracing::error!(?error, "tcp hole punch accept error");
@@ -722,10 +726,6 @@ where
         )
         .await??;
 
-        tracing::info!(
-            dst_peer_id,
-            "tcp hole punch initiator accepted and added server tunnel"
-        );
         Ok(())
     }
 
@@ -909,10 +909,13 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::{
+        io,
+        sync::atomic::{AtomicBool, AtomicUsize, Ordering},
+    };
 
     use super::*;
-    use crate::tunnel::Tunnel;
+    use crate::{host::testkit::TestTcpSocket, tunnel::Tunnel};
 
     #[derive(Default)]
     struct MockProtocols {
@@ -1089,6 +1092,79 @@ mod tests {
         assert!(blacklist.contains(7));
         blacklist.cleanup();
         assert!(blacklist.contains(7));
+    }
+
+    struct SingleAcceptListener {
+        local_addr: SocketAddr,
+        accept_calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl VirtualTcpListener for SingleAcceptListener {
+        type Socket = TestTcpSocket;
+
+        fn local_addr(&self) -> io::Result<SocketAddr> {
+            Ok(self.local_addr)
+        }
+
+        async fn accept(&self) -> io::Result<(Self::Socket, SocketAddr)> {
+            if self.accept_calls.fetch_add(1, Ordering::Relaxed) == 0 {
+                let (socket, _) = tokio::io::duplex(64);
+                return Ok((TestTcpSocket(socket), "127.0.0.1:12345".parse().unwrap()));
+            }
+            std::future::pending().await
+        }
+    }
+
+    #[derive(Default)]
+    struct CountingAcceptedSink {
+        accepted: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl TcpHolePunchTransportSink for CountingAcceptedSink {
+        type ConnectedSocket = ();
+        type AcceptedSocket = TestTcpSocket;
+
+        async fn add_connected_transport(
+            &self,
+            _socket: (),
+            _requested_url: url::Url,
+            _admission: TcpHolePunchAdmission,
+        ) -> Result<(), TcpHolePunchTransportError> {
+            Err(TcpHolePunchTransportError::Admission(anyhow::anyhow!(
+                "unexpected connected transport"
+            )))
+        }
+
+        async fn add_accepted_transport(
+            &self,
+            _socket: Self::AcceptedSocket,
+            _local_url: url::Url,
+        ) -> Result<(), TcpHolePunchTransportError> {
+            self.accepted.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn accept_connections_returns_after_first_admitted_tunnel() {
+        let listener = Arc::new(SingleAcceptListener {
+            local_addr: "127.0.0.1:23333".parse().unwrap(),
+            accept_calls: AtomicUsize::new(0),
+        });
+        let sink = Arc::new(CountingAcceptedSink::default());
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            accept_connections(listener.clone(), sink.clone(), 1),
+        )
+        .await
+        .expect("accept loop must end after admitting a tunnel");
+
+        assert!(result.is_ok(), "an admitted tunnel completes the punch");
+        assert_eq!(sink.accepted.load(Ordering::Relaxed), 1);
+        assert_eq!(listener.accept_calls.load(Ordering::Relaxed), 1);
     }
 
     #[test]

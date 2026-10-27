@@ -1980,6 +1980,10 @@ pub(crate) async fn close_peer_conn(
     ret
 }
 
+/// Server-admitted connections kept per logical peer: one default path plus room
+/// for direct or hole-punched alternatives.
+const MAX_SERVER_CONNS_PER_PEER: usize = 3;
+
 pub(crate) struct PeerConnectionAdmission {
     my_peer_id: PeerId,
     context: ArcPeerContext,
@@ -1989,6 +1993,7 @@ pub(crate) struct PeerConnectionAdmission {
     peer_session_store: Arc<PeerSessionStore>,
     recent_traffic: RecentTrafficTracker,
     reserved_my_peer_id_map: DashMap<String, PeerId>,
+    server_conn_admission_lock: tokio::sync::Mutex<()>,
 }
 
 impl PeerConnectionAdmission {
@@ -2010,6 +2015,7 @@ impl PeerConnectionAdmission {
             peer_session_store,
             recent_traffic,
             reserved_my_peer_id_map: DashMap::new(),
+            server_conn_admission_lock: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -2062,6 +2068,48 @@ impl PeerConnectionAdmission {
     fn release_reserved_peer_id(&self, network_name: &str) {
         self.reserved_my_peer_id_map.remove(network_name);
         shrink_dashmap(&self.reserved_my_peer_id_map, None);
+    }
+
+    async fn add_local_server_conn(
+        &self,
+        conn: PeerConn,
+        origin: PeerConnectionOrigin,
+        local_identity: &NetworkIdentity,
+        local_secure_mode: bool,
+    ) -> Result<PeerId, Error> {
+        // Attached-ring connections keep their own admission path.
+        if origin == PeerConnectionOrigin::Attached {
+            return add_new_peer_conn(self.peers.as_ref(), local_identity, local_secure_mode, conn)
+                .await;
+        }
+
+        // Count and insert under one lock: the peer may not exist yet on the first
+        // accept, so a per-peer guard would leave concurrent first accepts uncapped.
+        let _admission_guard = self.server_conn_admission_lock.lock().await;
+        let peer_id = conn.get_peer_id();
+        let current = self
+            .peers
+            .get_peer_by_id(peer_id)
+            .map(|peer| peer.server_conn_count())
+            .unwrap_or_default();
+        if current >= MAX_SERVER_CONNS_PER_PEER {
+            tracing::debug!(
+                peer_id,
+                ?origin,
+                current,
+                max = MAX_SERVER_CONNS_PER_PEER,
+                "rejecting server-admitted connection: per-peer cap reached"
+            );
+            // Dropping the conn closes its tunnel and releases the accepted socket.
+            return Err(anyhow::anyhow!(
+                "too many server conns, cur: {}, max: {}",
+                current,
+                MAX_SERVER_CONNS_PER_PEER
+            )
+            .into());
+        }
+
+        add_new_peer_conn(self.peers.as_ref(), local_identity, local_secure_mode, conn).await
     }
 
     #[tracing::instrument(ret, skip(self, tunnel))]
@@ -2159,13 +2207,9 @@ impl PeerConnectionAdmission {
                 .as_ref()
                 .map(|cfg| cfg.enabled)
                 .unwrap_or(false);
-            match add_new_peer_conn(
-                self.peers.as_ref(),
-                &local_identity,
-                local_secure_mode,
-                conn,
-            )
-            .await
+            match self
+                .add_local_server_conn(conn, origin, &local_identity, local_secure_mode)
+                .await
             {
                 Ok(peer_id) => {
                     self.recent_traffic.clear(peer_id);
@@ -4901,5 +4945,161 @@ mod tests {
 
         assert!(tracker.has(peer_id, Instant::now(), |_| false));
         tracker.mark(peer_id, false, true, |_| false);
+    }
+    async fn active_server_conn_count(manager: &PeerManagerCore, peer_id: PeerId) -> usize {
+        manager
+            .peers
+            .get_peer_by_id(peer_id)
+            .map(|peer| peer.server_conn_count())
+            .unwrap_or_default()
+    }
+
+    #[tokio::test]
+    async fn server_rejects_connections_beyond_the_per_peer_cap() {
+        let server = build_portable_for_test(portable_runtime_config("conn-cap")).unwrap();
+        let client = build_portable_for_test(portable_runtime_config("conn-cap")).unwrap();
+        server.run().await.unwrap();
+        client.run().await.unwrap();
+        let client_id = client.my_peer_id();
+
+        let mut server_results = Vec::new();
+        for _ in 0..MAX_SERVER_CONNS_PER_PEER + 2 {
+            let (client_tunnel, server_tunnel) = crate::tunnel::ring::create_ring_tunnel_pair();
+            let (_, server_result) = tokio::join!(
+                client.add_client_tunnel(client_tunnel),
+                server.add_tunnel_as_server(server_tunnel),
+            );
+            server_results.push(server_result);
+        }
+
+        assert!(
+            server_results[..MAX_SERVER_CONNS_PER_PEER]
+                .iter()
+                .all(|r| r.is_ok()),
+            "connections within the cap must be admitted: {server_results:?}"
+        );
+        assert!(
+            server_results[MAX_SERVER_CONNS_PER_PEER..]
+                .iter()
+                .all(|r| r.is_err()),
+            "connections beyond the cap must be rejected: {server_results:?}"
+        );
+        assert_eq!(
+            active_server_conn_count(&server, client_id).await,
+            MAX_SERVER_CONNS_PER_PEER,
+            "rejected connections must not stay in the peer connection map"
+        );
+
+        let server_id = server.my_peer_id();
+        let start = std::time::Instant::now();
+        loop {
+            let client_conns = client
+                .peers
+                .list_peer_conns(server_id)
+                .await
+                .unwrap_or_default()
+                .len();
+            if client_conns == MAX_SERVER_CONNS_PER_PEER {
+                break;
+            }
+            assert!(
+                start.elapsed() < Duration::from_secs(5),
+                "rejected tunnels must be closed; client still has {client_conns} conns"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn attached_ring_tunnels_bypass_the_server_cap() {
+        let server = build_portable_for_test(portable_runtime_config("conn-cap-attached")).unwrap();
+        let client = build_portable_for_test(portable_runtime_config("conn-cap-attached")).unwrap();
+        server.run().await.unwrap();
+        client.run().await.unwrap();
+        let client_id = client.my_peer_id();
+
+        for _ in 0..MAX_SERVER_CONNS_PER_PEER {
+            let (client_tunnel, server_tunnel) = crate::tunnel::ring::create_ring_tunnel_pair();
+            let (_, server_result) = tokio::join!(
+                client.add_client_tunnel(client_tunnel),
+                server.add_tunnel_as_server(server_tunnel),
+            );
+            server_result.unwrap();
+        }
+        assert_eq!(
+            active_server_conn_count(&server, client_id).await,
+            MAX_SERVER_CONNS_PER_PEER
+        );
+
+        let (client_tunnel, server_tunnel) = crate::tunnel::ring::create_ring_tunnel_pair();
+        let (_, server_result) = tokio::join!(
+            client.add_attached_ring_client_tunnel(client_tunnel),
+            server.add_attached_ring_tunnel_as_server(server_tunnel),
+        );
+
+        assert!(
+            server_result.is_ok(),
+            "attached ring connections must not consume the server cap: {server_result:?}"
+        );
+        assert_eq!(
+            active_server_conn_count(&server, client_id).await,
+            MAX_SERVER_CONNS_PER_PEER
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_server_admissions_never_exceed_the_per_peer_cap() {
+        let server =
+            Arc::new(build_portable_for_test(portable_runtime_config("conn-cap-race")).unwrap());
+        let client =
+            Arc::new(build_portable_for_test(portable_runtime_config("conn-cap-race")).unwrap());
+        server.run().await.unwrap();
+        client.run().await.unwrap();
+        let client_id = client.my_peer_id();
+
+        let attempts = MAX_SERVER_CONNS_PER_PEER * 3;
+        let client_admission_lock = Arc::new(tokio::sync::Mutex::new(()));
+        let mut tasks = Vec::new();
+        for _ in 0..attempts {
+            let (client_tunnel, server_tunnel) = crate::tunnel::ring::create_ring_tunnel_pair();
+            let client = client.clone();
+            let server = server.clone();
+            let client_admission_lock = client_admission_lock.clone();
+            tasks.push(tokio::spawn(async move {
+                // Serialise client admissions to keep peer conns alive; the server
+                // admissions still race to the cap.
+                let client_admission = async move {
+                    let _guard = client_admission_lock.lock().await;
+                    client.add_client_tunnel(client_tunnel).await
+                };
+                tokio::join!(client_admission, server.add_tunnel_as_server(server_tunnel),)
+            }));
+        }
+
+        let mut admitted = 0;
+        let mut rejected = 0;
+        for task in tasks {
+            let (_, server_result) = task.await.unwrap();
+            if server_result.is_ok() {
+                admitted += 1;
+            } else {
+                rejected += 1;
+            }
+        }
+
+        assert_eq!(
+            active_server_conn_count(&server, client_id).await,
+            MAX_SERVER_CONNS_PER_PEER,
+            "concurrent admissions must not exceed the cap: admitted={admitted}, rejected={rejected}"
+        );
+        assert_eq!(
+            admitted, MAX_SERVER_CONNS_PER_PEER,
+            "every admission within the cap must succeed: admitted={admitted}, rejected={rejected}"
+        );
+        assert_eq!(
+            rejected,
+            attempts - MAX_SERVER_CONNS_PER_PEER,
+            "excess concurrent admissions must be rejected: admitted={admitted}, rejected={rejected}"
+        );
     }
 }
