@@ -59,7 +59,7 @@ use super::{
     },
     context::{
         ArcPeerContext, CorePeerContext, CorePeerContextAdapters, NetworkIdentity, PeerContext,
-        PeerPacketPolicy, PeerStunInfoSource,
+        PeerContextEventSubscriber, PeerPacketPolicy, PeerStunInfoSource,
     },
     credential_manager::{CredentialManager, CredentialStorage},
     error::Error,
@@ -1521,6 +1521,10 @@ impl PeerManagerCore {
 
     pub fn get_peer_map(&self) -> Arc<PeerMap> {
         self.peers.clone()
+    }
+
+    pub(crate) fn subscribe_peer_events(&self) -> Option<PeerContextEventSubscriber> {
+        self.context.subscribe_peer_events()
     }
 
     pub fn get_relay_peer_map(&self) -> Arc<RelayPeerMap> {
