@@ -21,7 +21,7 @@ use url::Url;
 use crate::connectivity::hole_punch::policy::BackOff;
 use crate::foundation::time::Instant as DeadlineInstant;
 use crate::foundation::token_bucket::TokenBucket;
-use crate::peers::conn::peer_conn::PeerConnId;
+use crate::peers::conn::{peer_conn::PeerConnId, peer_map::PeerMap};
 use crate::peers::context::PeerContextEventSubscriber;
 use crate::tunnel::ring::RingTunnelRegistry;
 use crate::{
@@ -302,6 +302,8 @@ pub struct ManualConnectorSnapshot {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ManualConnectorOptions {
+    /// Retained for config and serde compatibility. The manager no longer waits
+    /// on this interval: retries follow the per-URL backoff schedule.
     pub reconnect_interval: Duration,
     pub connect_timeout: Duration,
     pub endpoint_discovery_timeout: Duration,
@@ -444,6 +446,10 @@ impl ManualDialSchedule {
     }
 
     /// Dials interrupted by a manager stop are retried when it starts again.
+    ///
+    /// The interrupted dial is not asked whether it admitted a connection before
+    /// the stop; that is unreachable today because instance start and stop clear
+    /// peer resources first.
     fn requeue_interrupted(&mut self) {
         for entry in self.entries.values_mut() {
             if entry.retry == ManualConnectorRetry::Dialing {
@@ -452,11 +458,14 @@ impl ManualDialSchedule {
         }
     }
 
-    fn next_deadline(&self) -> Option<DeadlineInstant> {
+    /// Earliest pending timer. A deadline that already passed belongs to a due
+    /// entry that has not started its dial yet; turning it into a timer would
+    /// make the manager loop sleep on a past instant and spin.
+    fn next_deadline(&self, now: DeadlineInstant) -> Option<DeadlineInstant> {
         self.entries
             .values()
             .filter_map(|entry| match entry.retry {
-                ManualConnectorRetry::Backoff { deadline } => Some(deadline),
+                ManualConnectorRetry::Backoff { deadline } if deadline > now => Some(deadline),
                 _ => None,
             })
             .min()
@@ -507,7 +516,6 @@ impl ManualDialSchedule {
         conn_alive: &dyn Fn(PeerId, PeerConnId) -> bool,
         peer_alive: &dyn Fn(PeerId) -> bool,
     ) {
-        let jitter = (self.jitter)();
         let urls = self.entries.keys().cloned().collect::<Vec<_>>();
         for url in &urls {
             let Some(entry) = self.entries.get_mut(url) else {
@@ -519,6 +527,9 @@ impl ManualDialSchedule {
             if conn_alive(admitted.peer_id, admitted.conn_id) {
                 continue;
             }
+            // Measured when the death is detected, so detection lag can only make
+            // the window look longer: a reset is never granted before 30s of
+            // real liveness.
             entry.retry = if now.saturating_duration_since(admitted.admitted_at)
                 >= MANUAL_STABLE_CONN_THRESHOLD
             {
@@ -540,7 +551,7 @@ impl ManualDialSchedule {
             if peer_alive(peer_id) {
                 continue;
             }
-            let deadline = now + jittered_backoff(entry.backoff.next_backoff(), jitter);
+            let deadline = now + jittered_backoff(entry.backoff.next_backoff(), (self.jitter)());
             entry.retry = ManualConnectorRetry::Backoff { deadline };
         }
     }
@@ -562,8 +573,10 @@ struct ManualDialGuard {
 
 impl ManualDialGuard {
     fn new() -> Self {
+        // Capacity one: five starts in the same instant is the storm this guard
+        // exists to prevent, so attempts are spaced at the fill rate instead.
         Self {
-            permits: TokenBucket::new(MANUAL_DIALS_PER_SECOND, MANUAL_DIALS_PER_SECOND),
+            permits: TokenBucket::new(1, MANUAL_DIALS_PER_SECOND),
             in_flight: 0,
         }
     }
@@ -821,7 +834,7 @@ where
             let now = DeadlineInstant::now();
             let permit_retry_at = start_due_attempts(&data, &mut attempts, &mut attempt_urls, now);
             let deadline =
-                earliest_deadline(schedule_mutex(&data).next_deadline(), permit_retry_at);
+                earliest_deadline(schedule_mutex(&data).next_deadline(now), permit_retry_at);
 
             tokio::select! {
                 _ = cancel.cancelled() => break,
@@ -856,18 +869,14 @@ fn schedule_mutex<H>(data: &ManualConnectorData<H>) -> std::sync::MutexGuard<'_,
 where
     H: ManualConnectorHost,
 {
-    data.schedule
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
+    lock_schedule(&data.schedule)
 }
 
 fn dial_guard_mutex<H>(data: &ManualConnectorData<H>) -> std::sync::MutexGuard<'_, ManualDialGuard>
 where
     H: ManualConnectorHost,
 {
-    data.dial_guard
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
+    lock_guard(&data.dial_guard)
 }
 
 fn earliest_deadline(
@@ -891,37 +900,78 @@ fn start_due_attempts<H>(
 where
     H: ManualConnectorHost,
 {
-    let mut permit_retry_at = None;
-    loop {
-        let Some(url) = schedule_mutex(data).next_ready(now) else {
-            break;
-        };
-        match dial_guard_mutex(data).try_begin() {
-            ManualDialPermit::Begin => {}
-            ManualDialPermit::AtCapacity => break,
-            ManualDialPermit::RateLimited => {
-                permit_retry_at = Some(now + MANUAL_DIAL_PERMIT_REFILL);
-                break;
-            }
-        }
-        let Some(reservation) = claim_connector_for_dial(&data.state, &url) else {
-            // The connector was re-added while its previous attempt still owns it;
-            // wait for that attempt to report back instead of dialling twice.
-            dial_guard_mutex(data).release();
-            schedule_mutex(data).begin_dial(&url);
-            continue;
-        };
-        schedule_mutex(data).begin_dial(&url);
+    let (claims, permit_retry_at) =
+        plan_due_attempts(&data.schedule, &data.dial_guard, &data.state, now);
+    for claim in claims {
+        let url = claim.url.clone();
         let task_data = data.clone();
         let task_url = url.clone();
         let handle = attempts.spawn(async move {
             let result = reconnect(task_data, task_url.clone()).await;
-            drop(reservation);
+            drop(claim);
             (task_url, result)
         });
         attempt_urls.insert(handle.id(), url);
     }
     permit_retry_at
+}
+
+/// Claims every connector the schedule and the dial guard allow to dial now.
+///
+/// Returns the claims to spawn and, when the guard blocked the pass, the instant
+/// at which a permit may be available again. Both limits report that instant:
+/// leaving it out while a due entry waits on a full slot would make the caller
+/// sleep on that entry's past deadline.
+///
+/// The schedule lock is taken per step, never across `claim_connector_for_dial`:
+/// the connector mutators hold `state_lock` while taking the schedule lock, so
+/// nesting them here in the opposite order would deadlock.
+fn plan_due_attempts(
+    schedule: &Mutex<ManualDialSchedule>,
+    guard: &Mutex<ManualDialGuard>,
+    state: &Arc<ManualConnectorState>,
+    now: DeadlineInstant,
+) -> (Vec<ReconnectReservation>, Option<DeadlineInstant>) {
+    let mut claims = Vec::new();
+    let mut permit_retry_at = None;
+    loop {
+        // `let ... else` drops the guard at the end of the statement; a `while
+        // let` scrutinee would keep it alive across the body's re-lock.
+        let Some(url) = lock_schedule(schedule).next_ready(now) else {
+            break;
+        };
+        match lock_guard(guard).try_begin() {
+            ManualDialPermit::Begin => {}
+            ManualDialPermit::AtCapacity | ManualDialPermit::RateLimited => {
+                permit_retry_at = Some(now + MANUAL_DIAL_PERMIT_REFILL);
+                break;
+            }
+        }
+        let Some(claim) = claim_connector_for_dial(state, &url) else {
+            // The connector was re-added while its previous attempt still owns it;
+            // wait for that attempt to report back instead of dialling twice.
+            lock_guard(guard).release();
+            lock_schedule(schedule).begin_dial(&url);
+            continue;
+        };
+        lock_schedule(schedule).begin_dial(&url);
+        claims.push(claim);
+    }
+    (claims, permit_retry_at)
+}
+
+fn lock_schedule(
+    schedule: &Mutex<ManualDialSchedule>,
+) -> std::sync::MutexGuard<'_, ManualDialSchedule> {
+    schedule
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn lock_guard(guard: &Mutex<ManualDialGuard>) -> std::sync::MutexGuard<'_, ManualDialGuard> {
+    guard
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 fn finish_attempt<H>(
@@ -955,6 +1005,44 @@ fn finish_attempt<H>(
     }
 }
 
+/// Liveness of a manual connector's admitted connection.
+///
+/// A manual dial into another network is admitted into the foreign-network
+/// client's own peer map, so manual connections live in two maps and both must
+/// answer. Neither predicate may use `PeerManagerCore::has_directly_connected_conn`:
+/// its foreign fallback only checks peer presence, not liveness.
+struct ManualConnLiveness {
+    peer_maps: [Arc<PeerMap>; 2],
+}
+
+impl ManualConnLiveness {
+    fn new(local_peer_map: Arc<PeerMap>, foreign_peer_map: Arc<PeerMap>) -> Self {
+        Self {
+            peer_maps: [local_peer_map, foreign_peer_map],
+        }
+    }
+
+    /// `get_directly_connections` does not filter closed conns while
+    /// `has_directly_connected_conn` does, so the two predicates disagree for as
+    /// long as the close listener has not removed the conn. That is benign: the
+    /// removal also emits `PeerConnRemoved`, which re-runs this reconcile.
+    fn conn_alive(&self, peer_id: PeerId, conn_id: PeerConnId) -> bool {
+        self.peer_maps.iter().any(|peer_map| {
+            peer_map
+                .get_directly_connections_by_peer_id(peer_id)
+                .contains(&conn_id)
+        })
+    }
+
+    fn peer_alive(&self, peer_id: PeerId) -> bool {
+        self.peer_maps.iter().any(|peer_map| {
+            peer_map
+                .get_peer_by_id(peer_id)
+                .is_some_and(|peer| peer.has_directly_connected_conn())
+        })
+    }
+}
+
 /// Re-applies the peer manager's current connection view to admitted URLs.
 fn reconcile_schedule<H>(data: &ManualConnectorData<H>)
 where
@@ -963,18 +1051,15 @@ where
     let Some(peer_manager) = data.peer_manager.upgrade() else {
         return;
     };
-    let peer_map = peer_manager.get_peer_map();
-    let conn_alive = |peer_id: PeerId, conn_id: PeerConnId| {
-        peer_map
-            .get_directly_connections_by_peer_id(peer_id)
-            .contains(&conn_id)
-    };
-    let peer_alive = |peer_id: PeerId| {
-        peer_map
-            .get_peer_by_id(peer_id)
-            .is_some_and(|peer| peer.has_directly_connected_conn())
-    };
-    schedule_mutex(data).reconcile(DeadlineInstant::now(), &conn_alive, &peer_alive);
+    let liveness = ManualConnLiveness::new(
+        peer_manager.get_peer_map(),
+        peer_manager.get_foreign_network_client().get_peer_map(),
+    );
+    schedule_mutex(data).reconcile(
+        DeadlineInstant::now(),
+        &|peer_id, conn_id| liveness.conn_alive(peer_id, conn_id),
+        &|peer_id| liveness.peer_alive(peer_id),
+    );
 }
 
 async fn recv_peer_event(peer_events: &mut Option<PeerContextEventSubscriber>) {
@@ -984,6 +1069,9 @@ async fn recv_peer_event(peer_events: &mut Option<PeerContextEventSubscriber>) {
     match receiver.recv().await {
         Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
         Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+            tracing::warn!(
+                "manual connector peer event stream closed; admitted connections are no longer reconciled"
+            );
             *peer_events = None;
         }
     }
@@ -1528,7 +1616,13 @@ where
 mod tests {
     use std::sync::Mutex;
 
+    use crate::peers::{
+        conn::{peer_conn::PeerConn, peer_map::PeerMap, peer_session::PeerSessionStore},
+        create_packet_recv_chan,
+        test_support::NoopPeerContext,
+    };
     use crate::socket::udp::UdpSessionProtocol;
+    use crate::tunnel::ring::create_ring_tunnel_pair;
 
     use super::*;
 
@@ -1930,6 +2024,40 @@ mod tests {
         schedule.entries.get(url).expect("registered URL").retry
     }
 
+    /// Builds a peer map holding one live client conn, as the foreign-network
+    /// client keeps it for a manual connector into another network.
+    async fn peer_map_with_live_conn(
+        my_peer_id: PeerId,
+    ) -> (Arc<PeerMap>, PeerId, PeerConnId, PeerConn) {
+        let session_store = Arc::new(PeerSessionStore::new());
+        let (client_tunnel, server_tunnel) = create_ring_tunnel_pair();
+        let client_ctx = Arc::new(NoopPeerContext::default());
+        let server_ctx = Arc::new(NoopPeerContext::default());
+        let mut client = PeerConn::new(
+            my_peer_id,
+            client_ctx.clone(),
+            client_tunnel,
+            session_store.clone(),
+        );
+        let mut server = PeerConn::new(2, server_ctx, server_tunnel, session_store);
+        let (client_ret, server_ret) = tokio::join!(
+            client.do_handshake_as_client(),
+            server.do_handshake_as_server_ext(|_, _| Ok(())),
+        );
+        client_ret.unwrap();
+        server_ret.unwrap();
+
+        let peer_id = client.get_peer_id();
+        let conn_id = client.get_conn_id();
+        let peer_map = Arc::new(PeerMap::new(
+            create_packet_recv_chan().0,
+            client_ctx,
+            my_peer_id,
+        ));
+        peer_map.add_new_peer_conn(client).await.unwrap();
+        (peer_map, peer_id, conn_id, server)
+    }
+
     #[tokio::test(start_paused = true)]
     async fn retry_backoff_doubles_from_one_second_up_to_a_capped_minute() {
         let url = retry_url(11010);
@@ -2045,14 +2173,16 @@ mod tests {
             ManualConnectorRetry::Refused { peer_id: 7 }
         );
         assert_eq!(schedule.next_ready(now), None);
-        assert_eq!(schedule.next_deadline(), None);
+        assert_eq!(schedule.next_deadline(now), None);
 
         schedule.reconcile(now + Duration::from_secs(5), &conn_gone, &peer_connected);
         assert_eq!(schedule.next_ready(now + Duration::from_secs(5)), None);
 
         // The peer's remaining connection is finally removed: one dial, after backoff.
         schedule.reconcile(now + Duration::from_secs(5), &conn_gone, &peer_gone);
-        let deadline = schedule.next_deadline().expect("resumed through backoff");
+        let deadline = schedule
+            .next_deadline(now + Duration::from_secs(5))
+            .expect("resumed through backoff");
         assert_eq!(
             deadline - (now + Duration::from_secs(5)),
             Duration::from_secs(1)
@@ -2073,7 +2203,7 @@ mod tests {
         schedule.begin_dial(&url);
         schedule.fail_dial(&url, now);
 
-        let deadline = schedule.next_deadline().expect("backoff deadline");
+        let deadline = schedule.next_deadline(now).expect("backoff deadline");
         assert_eq!(deadline, now + Duration::from_secs(1));
         assert_eq!(
             schedule.next_ready(deadline - Duration::from_millis(1)),
@@ -2085,50 +2215,214 @@ mod tests {
     #[tokio::test]
     async fn due_connector_burst_never_exceeds_four_concurrent_dials() {
         let now = DeadlineInstant::now();
+        let state = Arc::new(ManualConnectorState::default());
         let mut schedule = ManualDialSchedule::new(Box::new(|| 0.0));
         for offset in 0..12 {
-            schedule.register(&retry_url(11010 + offset));
+            let url = retry_url(11010 + offset);
+            state.connectors.insert(url.clone());
+            schedule.register(&url);
         }
+        let schedule = Mutex::new(schedule);
+        let guard = Mutex::new(ManualDialGuard::with_permits(TokenBucket::new(
+            1_000, 1_000,
+        )));
 
+        let (claims, _) = plan_due_attempts(&schedule, &guard, &state, now);
+        assert_eq!(claims.len(), 4);
+        assert_eq!(lock_guard(&guard).try_begin(), ManualDialPermit::AtCapacity);
+        let busy_urls = claims
+            .iter()
+            .map(|claim| claim.url.clone())
+            .collect::<Vec<_>>();
+
+        // A finished dial frees one slot for the next due connector; the claims
+        // stay alive so the first four dials remain in flight.
+        lock_guard(&guard).release();
+        let (next_claims, _) = plan_due_attempts(&schedule, &guard, &state, now);
+        assert_eq!(next_claims.len(), 1);
+        assert!(!busy_urls.contains(&next_claims[0].url));
+        assert_eq!(
+            retry_state(&lock_schedule(&schedule), &next_claims[0].url),
+            ManualConnectorRetry::Dialing
+        );
+    }
+
+    #[tokio::test]
+    async fn connector_owned_by_an_earlier_attempt_does_not_leak_a_dial_permit() {
+        let now = DeadlineInstant::now();
+        let state = Arc::new(ManualConnectorState::default());
+        let mut schedule = ManualDialSchedule::new(Box::new(|| 0.0));
+        for offset in 0..MANUAL_MAX_CONCURRENT_DIALS {
+            let url = retry_url(11_010 + offset as u16);
+            // Re-added during its previous attempt: the connector is still owned
+            // by that in-flight dial, so every claim in this pass fails.
+            state.reconnecting.insert(url.clone());
+            schedule.register(&url);
+        }
+        let schedule = Mutex::new(schedule);
+        let guard = Mutex::new(ManualDialGuard::with_permits(TokenBucket::new(
+            1_000, 1_000,
+        )));
+
+        let (claims, permit_retry_at) = plan_due_attempts(&schedule, &guard, &state, now);
+        assert!(claims.is_empty());
+        assert_eq!(permit_retry_at, None);
+        // Every failed claim returned its concurrency slot, so no dial is blocked.
+        assert_eq!(lock_guard(&guard).try_begin(), ManualDialPermit::Begin);
+        // And the owned connectors wait for their attempt instead of being retried.
+        assert_eq!(lock_schedule(&schedule).next_ready(now), None);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn due_connector_blocked_by_full_dial_slots_keeps_a_future_timer() {
+        let now = DeadlineInstant::now();
+        let state = Arc::new(ManualConnectorState::default());
+        let mut schedule = ManualDialSchedule::new(Box::new(|| 0.0));
         let mut guard = ManualDialGuard::with_permits(TokenBucket::new(1_000, 1_000));
-        let mut started = Vec::new();
-        let start_due = |schedule: &mut ManualDialSchedule,
-                         guard: &mut ManualDialGuard,
-                         started: &mut Vec<Url>| {
-            while let Some(url) = schedule.next_ready(now) {
-                match guard.try_begin() {
-                    ManualDialPermit::Begin => {
-                        schedule.begin_dial(&url);
-                        started.push(url);
-                    }
-                    ManualDialPermit::AtCapacity | ManualDialPermit::RateLimited => break,
-                }
+
+        // Every dial slot is busy and one more connector is already due.
+        for offset in 0..MANUAL_MAX_CONCURRENT_DIALS {
+            let url = retry_url(11_010 + offset as u16);
+            state.connectors.insert(url.clone());
+            schedule.register(&url);
+            schedule.begin_dial(&url);
+            assert_eq!(guard.try_begin(), ManualDialPermit::Begin);
+        }
+        let due_url = retry_url(11_020);
+        state.connectors.insert(due_url.clone());
+        schedule.register(&due_url);
+        schedule.begin_dial(&due_url);
+        // This dial failed two seconds ago, so its one-second backoff elapsed.
+        schedule.fail_dial(&due_url, now - Duration::from_secs(2));
+        let due_deadline = now - Duration::from_secs(1);
+
+        let schedule = Mutex::new(schedule);
+        let guard = Mutex::new(guard);
+        let (claims, permit_retry_at) = plan_due_attempts(&schedule, &guard, &state, now);
+        assert!(claims.is_empty());
+        assert_eq!(
+            retry_state(&lock_schedule(&schedule), &due_url),
+            ManualConnectorRetry::Backoff {
+                deadline: due_deadline
             }
-        };
+        );
+        let deadline =
+            earliest_deadline(lock_schedule(&schedule).next_deadline(now), permit_retry_at);
+        assert!(
+            deadline.is_some_and(|deadline| deadline > now),
+            "a due connector blocked by full dial slots must leave the loop asleep, got {deadline:?}"
+        );
 
-        start_due(&mut schedule, &mut guard, &mut started);
-        assert_eq!(started.len(), 4);
-        assert_eq!(guard.try_begin(), ManualDialPermit::AtCapacity);
-
-        // A finished dial frees one slot for the next due connector.
-        guard.release();
-        start_due(&mut schedule, &mut guard, &mut started);
-        assert_eq!(started.len(), 5);
+        // A finished dial frees one slot and the due connector starts.
+        lock_guard(&guard).release();
+        let (claims, _) = plan_due_attempts(&schedule, &guard, &state, now);
+        assert_eq!(claims.len(), 1);
+        assert_eq!(claims[0].url, due_url);
+        assert_eq!(
+            retry_state(&lock_schedule(&schedule), &due_url),
+            ManualConnectorRetry::Dialing
+        );
     }
 
     #[test]
     fn dial_guard_limits_a_burst_to_five_attempts_per_second() {
         let mut guard = ManualDialGuard::new();
-        for _ in 0..5 {
-            assert_eq!(guard.try_begin(), ManualDialPermit::Begin);
-            guard.release();
-        }
+        assert_eq!(guard.try_begin(), ManualDialPermit::Begin);
+        assert_eq!(guard.try_begin(), ManualDialPermit::RateLimited);
+        guard.release();
         assert_eq!(guard.try_begin(), ManualDialPermit::RateLimited);
 
         // One permit refills every 200ms at five dials per second.
         std::thread::sleep(Duration::from_millis(250));
 
         assert_eq!(guard.try_begin(), ManualDialPermit::Begin);
+        assert_eq!(guard.try_begin(), ManualDialPermit::RateLimited);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn refused_connectors_released_together_get_independent_jitter() {
+        let samples = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let schedule_samples = samples.clone();
+        let mut schedule = ManualDialSchedule::new(Box::new(move || {
+            if schedule_samples
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                .is_multiple_of(2)
+            {
+                -1.0
+            } else {
+                1.0
+            }
+        }));
+        let now = DeadlineInstant::now();
+        let urls = [retry_url(11_010), retry_url(11_011)];
+        for url in &urls {
+            schedule.register(url);
+            schedule.begin_dial(url);
+            schedule.admit(url, admitted_conn(7, now));
+        }
+        let conn_gone = |_: PeerId, _: PeerConnId| false;
+        let peer_connected = |_: PeerId| true;
+        schedule.reconcile(now, &conn_gone, &peer_connected);
+        for url in &urls {
+            assert_eq!(
+                retry_state(&schedule, url),
+                ManualConnectorRetry::Refused { peer_id: 7 }
+            );
+        }
+
+        samples.store(0, std::sync::atomic::Ordering::Relaxed);
+        let peer_gone = |_: PeerId| false;
+        schedule.reconcile(now, &conn_gone, &peer_gone);
+
+        let mut steps = urls.map(|url| match retry_state(&schedule, &url) {
+            ManualConnectorRetry::Backoff { deadline } => deadline - now,
+            other => panic!("a released connector must back off, got {other:?}"),
+        });
+        steps.sort();
+        assert_eq!(
+            steps,
+            [Duration::from_millis(800), Duration::from_millis(1200)]
+        );
+    }
+
+    #[tokio::test]
+    async fn foreign_network_conn_keeps_the_url_active() {
+        let (foreign_peer_map, peer_id, conn_id, _server_conn) = peer_map_with_live_conn(1).await;
+        let local_peer_map = Arc::new(PeerMap::new(
+            create_packet_recv_chan().0,
+            Arc::new(NoopPeerContext::default()),
+            1,
+        ));
+        let liveness = ManualConnLiveness::new(local_peer_map, foreign_peer_map);
+
+        let url = retry_url(11_010);
+        let now = DeadlineInstant::now();
+        let mut schedule = ManualDialSchedule::new(Box::new(|| 0.0));
+        schedule.register(&url);
+        schedule.begin_dial(&url);
+        schedule.admit(
+            &url,
+            ManualAdmittedConn {
+                peer_id,
+                conn_id,
+                admitted_at: now,
+            },
+        );
+        schedule.reconcile(
+            now,
+            &|peer_id, conn_id| liveness.conn_alive(peer_id, conn_id),
+            &|peer_id| liveness.peer_alive(peer_id),
+        );
+
+        assert!(
+            matches!(
+                retry_state(&schedule, &url),
+                ManualConnectorRetry::Active(_)
+            ),
+            "a live foreign-network conn must not be reconciled away: {:?}",
+            retry_state(&schedule, &url)
+        );
+        assert_eq!(schedule.next_ready(now), None);
     }
 
     #[test]
